@@ -3503,6 +3503,257 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
         }
       }),
     );
+
+    describe("submodules", () => {
+      const makeRepoWithSubmodule = Effect.fn("makeRepoWithSubmodule")(function* () {
+        const remote = yield* makeTmpDir("git-submodule-");
+        yield* initRepoWithCommit(remote);
+        yield* writeTextFile(remote, "a.txt", "one\ntwo\n");
+        yield* git(remote, ["add", "."]);
+        yield* git(remote, ["commit", "-m", "add a"]);
+        const cwd = yield* makeTmpDir();
+        yield* initRepoWithCommit(cwd);
+        yield* git(cwd, [
+          "-c",
+          "protocol.file.allow=always",
+          "submodule",
+          "add",
+          remote,
+          "frontend",
+        ]);
+        yield* git(cwd, ["commit", "-m", "add submodule"]);
+        return { cwd, submodule: `${cwd}/frontend` };
+      });
+      const source = (preview: ReviewDiffPreviewResult, kind: string) =>
+        preview.sources.find((candidate) => candidate.kind === kind)!;
+
+      it.effect("expands uncommitted and untracked submodule files in both views", () =>
+        Effect.gen(function* () {
+          const { cwd, submodule } = yield* makeRepoWithSubmodule();
+          const driver = yield* GitVcsDriver.GitVcsDriver;
+          yield* writeTextFile(cwd, "root.txt", "root\n");
+          yield* writeTextFile(submodule, "a.txt", "one\nchanged\n");
+          yield* writeTextFile(submodule, "new.txt", "fresh\n");
+
+          const preview = yield* driver.getReviewDiffPreview({ cwd, baseRef: "HEAD" });
+          const dirty = source(preview, "working-tree");
+          assert.deepStrictEqual(dirty.files, [
+            { path: "root.txt", previousPath: null, additions: 1, deletions: 0 },
+            { path: "frontend/a.txt", previousPath: null, additions: 1, deletions: 1 },
+            { path: "frontend/new.txt", previousPath: null, additions: 1, deletions: 0 },
+          ]);
+          assert.include(dirty.diff, "diff --git a/frontend/a.txt b/frontend/a.txt");
+          assert.include(dirty.diff, "+++ b/frontend/new.txt");
+          assert.notInclude(dirty.diff, "Subproject commit");
+          const metadata = source(
+            yield* driver.getReviewDiffPreview({ cwd, baseRef: "HEAD", metadataOnly: true }),
+            "working-tree",
+          );
+          assert.deepStrictEqual(metadata.files, dirty.files);
+          assert.isEmpty(metadata.diff);
+          assert.isNotTrue(metadata.truncated);
+
+          // The submodule did not exist at the merge base, so its whole tree is new.
+          const added = yield* driver.getReviewDiffPreview({ cwd, baseRef: "HEAD~1" });
+          assert.includeMembers(
+            (source(added, "branch-range").files ?? []).map((file) => file.path),
+            ["frontend/a.txt", "frontend/new.txt"],
+          );
+
+          const untrackedOnly = yield* makeRepoWithSubmodule();
+          yield* writeTextFile(untrackedOnly.submodule, "only.txt", "only\n");
+          assert.deepStrictEqual(
+            source(yield* driver.getReviewDiffPreview({ cwd: untrackedOnly.cwd }), "working-tree")
+              .files,
+            [{ path: "frontend/only.txt", previousPath: null, additions: 1, deletions: 0 }],
+          );
+        }),
+      );
+
+      it.effect("replaces a moved gitlink with the submodule's real files", () =>
+        Effect.gen(function* () {
+          const { cwd, submodule } = yield* makeRepoWithSubmodule();
+          const driver = yield* GitVcsDriver.GitVcsDriver;
+          const base = yield* git(cwd, ["rev-parse", "HEAD"]);
+          yield* writeTextFile(submodule, "a.txt", "one\ncommitted\n");
+          yield* git(submodule, ["commit", "-am", "edit a"]);
+
+          const moved = source(
+            yield* driver.getReviewDiffPreview({ cwd, baseRef: "HEAD" }),
+            "working-tree",
+          );
+          const expected = [
+            { path: "frontend/a.txt", previousPath: null, additions: 1, deletions: 1 },
+          ];
+          assert.deepStrictEqual(moved.files, expected);
+          assert.notInclude(moved.diff, "Subproject commit");
+
+          yield* git(cwd, ["commit", "-am", "bump submodule"]);
+          const sha = yield* git(cwd, ["rev-parse", "HEAD"]);
+          const commit = (yield* driver.getReviewDiffPreview({ cwd, commitSha: sha })).sources[0]!;
+          assert.deepStrictEqual(commit.files, expected);
+          const commitMetadata = (yield* driver.getReviewDiffPreview({
+            cwd,
+            commitSha: sha,
+            metadataOnly: true,
+          })).sources[0]!;
+          assert.deepStrictEqual(commitMetadata.files, expected);
+          assert.isTrue(commitMetadata.patchesDeferred);
+          assert.isNotTrue(commitMetadata.truncated);
+          assert.include(commit.diff, "+++ b/frontend/a.txt");
+          assert.notInclude(commit.diff, "Subproject commit");
+
+          const scoped = (yield* driver.getReviewDiffPreview({
+            cwd,
+            commitSha: sha,
+            file: { path: "frontend/a.txt", previousPath: null, sourceKind: "commit" },
+          })).sources[0]!;
+          assert.deepStrictEqual(scoped.files, expected);
+
+          assert.deepStrictEqual(
+            yield* driver.getReviewDiffFileContents(
+              makeReviewDiffFileContentsInput(cwd, {
+                sourceKind: "commit",
+                baseRef: base,
+                headRef: sha,
+                oldPath: "frontend/a.txt",
+                newPath: "frontend/a.txt",
+              }),
+            ),
+            { oldContents: "one\ntwo\n", newContents: "one\ncommitted\n" },
+          );
+        }),
+      );
+
+      it.effect("scopes file requests and contents to the owning submodule", () =>
+        Effect.gen(function* () {
+          const { cwd, submodule } = yield* makeRepoWithSubmodule();
+          const driver = yield* GitVcsDriver.GitVcsDriver;
+          yield* writeTextFile(submodule, "a.txt", "one\nchanged\n");
+          yield* writeTextFile(submodule, "new.txt", "fresh\n");
+
+          for (const [path, additions, deletions] of [
+            ["frontend/a.txt", 1, 1],
+            ["frontend/new.txt", 1, 0],
+          ] as const) {
+            const scoped = source(
+              yield* driver.getReviewDiffPreview({
+                cwd,
+                file: { path, previousPath: null, sourceKind: "working-tree" },
+              }),
+              "working-tree",
+            );
+            assert.deepStrictEqual(scoped.files, [
+              { path, previousPath: null, additions, deletions },
+            ]);
+            assert.include(scoped.diff, `+++ b/${path}`);
+            assert.isFalse(scoped.truncated);
+          }
+
+          assert.deepStrictEqual(
+            yield* driver.getReviewDiffFileContents(
+              makeReviewDiffFileContentsInput(cwd, {
+                oldPath: "frontend/a.txt",
+                newPath: "frontend/a.txt",
+              }),
+            ),
+            { oldContents: "one\ntwo\n", newContents: "one\nchanged\n" },
+          );
+        }),
+      );
+
+      it.effect("expands nested submodules from a subdirectory cwd", () =>
+        Effect.gen(function* () {
+          const { cwd, submodule } = yield* makeRepoWithSubmodule();
+          const driver = yield* GitVcsDriver.GitVcsDriver;
+          const nestedRemote = yield* makeTmpDir("git-nested-submodule-");
+          yield* initRepoWithCommit(nestedRemote);
+          yield* writeTextFile(nestedRemote, "deep.txt", "deep\n");
+          yield* git(nestedRemote, ["add", "."]);
+          yield* git(nestedRemote, ["commit", "-m", "add deep"]);
+          yield* git(submodule, [
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            nestedRemote,
+            "lib",
+          ]);
+          yield* git(submodule, ["commit", "-m", "add nested"]);
+          yield* git(cwd, ["commit", "-am", "bump submodule"]);
+          yield* writeTextFile(`${submodule}/lib`, "deep.txt", "deeper\n");
+
+          const dirty = source(yield* driver.getReviewDiffPreview({ cwd }), "working-tree");
+          assert.deepStrictEqual(dirty.files, [
+            { path: "frontend/lib/deep.txt", previousPath: null, additions: 1, deletions: 1 },
+          ]);
+          assert.include(dirty.diff, "+++ b/frontend/lib/deep.txt");
+
+          yield* writeTextFile(cwd, "docs/keep.txt", "keep\n");
+          assert.deepStrictEqual(
+            yield* driver.getReviewDiffFileContents(
+              makeReviewDiffFileContentsInput(`${cwd}/docs`, {
+                oldPath: "frontend/lib/deep.txt",
+                newPath: "frontend/lib/deep.txt",
+              }),
+            ),
+            { oldContents: "deep\n", newContents: "deeper\n" },
+          );
+        }),
+      );
+
+      it.effect("counts submodule files in Changes totals", () =>
+        Effect.gen(function* () {
+          const { cwd, submodule } = yield* makeRepoWithSubmodule();
+          const driver = yield* GitVcsDriver.GitVcsDriver;
+          yield* writeTextFile(submodule, "a.txt", "one\nchanged\nmore\n");
+          yield* writeTextFile(submodule, "new.txt", "fresh\n");
+
+          const status = yield* driver.statusDetailsLocal(cwd, { includeBranchChanges: true });
+          assert.deepStrictEqual(status.branchChanges, {
+            baseRef: null,
+            insertions: 3,
+            deletions: 1,
+          });
+        }),
+      );
+
+      it.effect("shares the patch budget across submodules", () =>
+        Effect.gen(function* () {
+          const { cwd, submodule } = yield* makeRepoWithSubmodule();
+          const driver = yield* GitVcsDriver.GitVcsDriver;
+          yield* writeTextFile(cwd, "root.txt", `${"root\n".repeat(30_000)}`);
+          yield* writeTextFile(submodule, "a.txt", "one\nchanged\n");
+
+          const dirty = source(yield* driver.getReviewDiffPreview({ cwd }), "working-tree");
+          assert.isTrue(dirty.truncated);
+          assert.notInclude(dirty.diff, "frontend/a.txt");
+          assert.deepStrictEqual(
+            (dirty.files ?? []).map((file) => file.path),
+            ["root.txt", "frontend/a.txt"],
+          );
+        }),
+      );
+
+      it.effect("keeps the pointer diff for an uninitialized submodule", () =>
+        Effect.gen(function* () {
+          const { cwd, submodule } = yield* makeRepoWithSubmodule();
+          const driver = yield* GitVcsDriver.GitVcsDriver;
+          const previous = yield* git(cwd, ["rev-parse", "HEAD:frontend"]);
+          yield* writeTextFile(submodule, "a.txt", "one\ncommitted\n");
+          yield* git(submodule, ["commit", "-am", "edit a"]);
+          yield* git(cwd, ["commit", "-am", "bump submodule"]);
+          yield* git(cwd, ["submodule", "deinit", "-f", "frontend"]);
+          const sha = yield* git(cwd, ["rev-parse", "HEAD"]);
+
+          const commit = (yield* driver.getReviewDiffPreview({ cwd, commitSha: sha })).sources[0]!;
+          assert.deepStrictEqual(commit.files, [
+            { path: "frontend", previousPath: null, additions: 1, deletions: 1 },
+          ]);
+          assert.include(commit.diff, `-Subproject commit ${previous}`);
+        }),
+      );
+    });
   });
 
   describe("repository status", () => {

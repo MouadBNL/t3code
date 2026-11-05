@@ -1195,6 +1195,275 @@ it.effect("restores a checkpoint before the first commit without staging its fil
   }).pipe(Effect.scoped, Effect.provide(layerGitContract)),
 );
 
+const makeSubmoduleRepo = Effect.fn("test.makeSubmoduleRepo")(function* () {
+  const fileSystem = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const base = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-submodule-checkpoint-" });
+  const origin = path.join(base, "origin");
+  const root = path.join(base, "root");
+  for (const repo of [origin, root]) {
+    yield* fileSystem.makeDirectory(repo);
+    yield* runGit(repo, ["init"]);
+    yield* runGit(repo, ["config", "user.email", "test@test.com"]);
+    yield* runGit(repo, ["config", "user.name", "Test"]);
+  }
+  yield* fileSystem.writeFileString(path.join(origin, "a.txt"), "one\n");
+  yield* runGit(origin, ["add", "."]);
+  yield* runGit(origin, ["commit", "-m", "origin"]);
+  yield* fileSystem.writeFileString(path.join(root, "root.txt"), "root\n");
+  yield* runGit(root, ["add", "."]);
+  yield* runGit(root, ["-c", "protocol.file.allow=always", "submodule", "add", origin, "frontend"]);
+  yield* runGit(root, ["commit", "-m", "root"]);
+  const submodule = path.join(root, "frontend");
+  yield* runGit(submodule, ["config", "user.email", "test@test.com"]);
+  yield* runGit(submodule, ["config", "user.name", "Test"]);
+  return { origin, root, submodule };
+});
+
+const submoduleRef = (name: string) => CheckpointRef.make(`refs/t3/checkpoints/submodule-${name}`);
+
+it.effect("checkpoint diffs report uncommitted and committed work inside a submodule", () =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const driver = yield* GitVcsDriver.makeVcsDriverShape();
+    const { root, submodule } = yield* makeSubmoduleRepo();
+    const capture = (name: string) =>
+      driver.checkpoints.captureCheckpoint({ cwd: root, checkpointRef: submoduleRef(name) });
+    const diff = (from: string, to: string, format: "patch" | "numstat", filePaths?: string[]) =>
+      driver.checkpoints.diffCheckpoints({
+        cwd: root,
+        fromCheckpointRef: submoduleRef(from),
+        toCheckpointRef: submoduleRef(to),
+        ignoreWhitespace: false,
+        format,
+        ...(filePaths === undefined ? {} : { filePaths }),
+      });
+
+    // A dirty edit from before the turn belongs to the baseline, not to the turn.
+    yield* fileSystem.writeFileString(path.join(submodule, "a.txt"), "one\nuser\n");
+    yield* capture("before");
+    yield* fileSystem.writeFileString(path.join(submodule, "a.txt"), "one\nuser\nagent\n");
+    yield* fileSystem.writeFileString(path.join(submodule, "new.txt"), "new\n");
+    yield* fileSystem.writeFileString(path.join(root, "root.txt"), "root\nagent\n");
+    yield* capture("dirty");
+
+    const numstat = yield* diff("before", "dirty", "numstat");
+    assert.deepStrictEqual(numstat.split("\0").filter(Boolean).toSorted(), [
+      "1\t0\tfrontend/a.txt",
+      "1\t0\tfrontend/new.txt",
+      "1\t0\troot.txt",
+    ]);
+    const patch = yield* diff("before", "dirty", "patch");
+    assert.include(patch, "diff --git a/frontend/a.txt b/frontend/a.txt");
+    assert.include(patch, "+agent");
+    assert.include(patch, "+++ b/frontend/new.txt");
+    assert.include(patch, "+++ b/root.txt");
+    assert.notInclude(patch, "+user");
+    assert.notInclude(patch, "Subproject commit");
+
+    const scoped = yield* diff("before", "dirty", "patch", ["frontend/new.txt"]);
+    assert.include(scoped, "+++ b/frontend/new.txt");
+    assert.notInclude(scoped, "frontend/a.txt");
+    assert.notInclude(scoped, "root.txt");
+
+    yield* runGit(submodule, ["add", "."]);
+    yield* runGit(submodule, ["commit", "-m", "agent"]);
+    yield* capture("committed");
+    assert.strictEqual(yield* diff("dirty", "committed", "patch"), "");
+    assert.strictEqual(yield* diff("dirty", "committed", "numstat"), "");
+
+    const status = yield* driver.execute({
+      operation: "test",
+      cwd: submodule,
+      args: ["branch", "--all", "--contains", "refs/t3/checkpoints/submodule-dirty"],
+    });
+    assert.strictEqual(status.stdout, "");
+  }).pipe(Effect.scoped, Effect.provide(layerGitContract)),
+);
+
+it.effect("checkpoint diffs cover nested, added and renamed submodule paths", () =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const driver = yield* GitVcsDriver.makeVcsDriverShape();
+    const { origin, root, submodule } = yield* makeSubmoduleRepo();
+    const allowFile = ["-c", "protocol.file.allow=always"];
+    yield* fileSystem.writeFileString(path.join(submodule, "long.txt"), "a\nb\nc\nd\ne\nf\ng\nh\n");
+    yield* runGit(submodule, ["add", "."]);
+    yield* runGit(submodule, ["commit", "-m", "long"]);
+    yield* runGit(submodule, [...allowFile, "submodule", "add", origin, "lib"]);
+    yield* runGit(submodule, ["commit", "-m", "nested"]);
+    yield* runGit(root, ["add", "."]);
+    yield* runGit(root, ["commit", "-m", "bump"]);
+    const fromCheckpointRef = submoduleRef("before-tree");
+    const toCheckpointRef = submoduleRef("after-tree");
+    yield* driver.checkpoints.captureCheckpoint({ cwd: root, checkpointRef: fromCheckpointRef });
+
+    yield* fileSystem.writeFileString(path.join(submodule, "lib", "a.txt"), "one\nnested\n");
+    yield* fileSystem.rename(path.join(submodule, "long.txt"), path.join(submodule, "moved.txt"));
+    // Newline-framed index-info would reject the leading quote, which Windows paths cannot hold.
+    const added = HostProcess.Platform.defaultValue() === "win32" ? "backend" : '"backend';
+    yield* runGit(root, [...allowFile, "submodule", "add", origin, added]);
+    yield* driver.checkpoints.captureCheckpoint({ cwd: root, checkpointRef: toCheckpointRef });
+
+    const numstat = yield* driver.checkpoints.diffCheckpoints({
+      cwd: root,
+      fromCheckpointRef,
+      toCheckpointRef,
+      ignoreWhitespace: false,
+      format: "numstat",
+    });
+    assert.deepStrictEqual(
+      numstat.split("\0").filter(Boolean).toSorted(),
+      [
+        "0\t0\t",
+        "3\t0\t.gitmodules",
+        `1\t0\t${added}/a.txt`,
+        "1\t0\tfrontend/lib/a.txt",
+        "frontend/long.txt",
+        "frontend/moved.txt",
+      ].toSorted(),
+    );
+  }).pipe(Effect.scoped, Effect.provide(layerGitContract)),
+);
+
+it.effect("checkpoint authored paths drop upstream commits pulled into a submodule", () =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const driver = yield* GitVcsDriver.makeVcsDriverShape();
+    const { origin, root, submodule } = yield* makeSubmoduleRepo();
+    const fromCheckpointRef = submoduleRef("before-pull");
+    const toCheckpointRef = submoduleRef("after-pull");
+    yield* driver.checkpoints.captureCheckpoint({ cwd: root, checkpointRef: fromCheckpointRef });
+
+    yield* fileSystem.writeFileString(path.join(origin, "upstream.txt"), "upstream\n");
+    yield* runGit(origin, ["add", "."]);
+    yield* driver.execute({
+      operation: "test",
+      cwd: origin,
+      args: ["commit", "-m", "upstream"],
+      env: { ...process.env, GIT_COMMITTER_DATE: "2020-01-01T00:00:00Z" },
+    });
+    yield* runGit(submodule, ["-c", "protocol.file.allow=always", "pull", "origin", "HEAD"]);
+    yield* fileSystem.writeFileString(path.join(submodule, "a.txt"), "one\nagent\n");
+    yield* fileSystem.writeFileString(path.join(root, "root.txt"), "root\nagent\n");
+    yield* driver.checkpoints.captureCheckpoint({ cwd: root, checkpointRef: toCheckpointRef });
+
+    const authored = yield* driver.checkpoints.listAuthoredPaths({
+      cwd: root,
+      fromCheckpointRef,
+      toCheckpointRef,
+    });
+    assert.isTrue(authored?.has("frontend/a.txt"));
+    assert.isTrue(authored?.has("root.txt"));
+    assert.isFalse(authored?.has("frontend/upstream.txt"));
+  }).pipe(Effect.scoped, Effect.provide(layerGitContract)),
+);
+
+it.effect("checkpoint restore reverts submodule files, keeps its HEAD and drops its refs", () =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const driver = yield* GitVcsDriver.makeVcsDriverShape();
+    const { root, submodule } = yield* makeSubmoduleRepo();
+    // Without an explicit opt-out, this checks the hidden snapshot out as the submodule's HEAD.
+    yield* runGit(root, ["config", "submodule.recurse", "true"]);
+    const checkpointRef = submoduleRef("restore");
+    yield* fileSystem.writeFileString(path.join(submodule, "a.txt"), "one\nuser\n");
+    yield* driver.checkpoints.captureCheckpoint({ cwd: root, checkpointRef });
+
+    yield* fileSystem.writeFileString(path.join(submodule, "a.txt"), "one\nuser\nagent\n");
+    yield* fileSystem.writeFileString(path.join(submodule, "added.txt"), "added\n");
+    yield* runGit(submodule, ["add", "added.txt"]);
+    yield* runGit(submodule, ["commit", "-m", "agent"]);
+    yield* fileSystem.writeFileString(path.join(submodule, "untracked.txt"), "untracked\n");
+    const head = (yield* driver.execute({
+      operation: "test",
+      cwd: submodule,
+      args: ["rev-parse", "HEAD"],
+    })).stdout;
+
+    assert.isTrue(
+      yield* driver.checkpoints.restoreCheckpoint({
+        cwd: root,
+        checkpointRef,
+        fallbackToHead: false,
+      }),
+    );
+    assert.strictEqual(
+      yield* fileSystem.readFileString(path.join(submodule, "a.txt")),
+      "one\nuser\n",
+    );
+    assert.isFalse(yield* fileSystem.exists(path.join(submodule, "added.txt")));
+    assert.isFalse(yield* fileSystem.exists(path.join(submodule, "untracked.txt")));
+    assert.strictEqual(
+      (yield* driver.execute({ operation: "test", cwd: submodule, args: ["rev-parse", "HEAD"] }))
+        .stdout,
+      head,
+    );
+
+    yield* driver.checkpoints.deleteCheckpointRefs({ cwd: root, checkpointRefs: [checkpointRef] });
+    const refs = yield* driver.execute({
+      operation: "test",
+      cwd: submodule,
+      args: ["for-each-ref", "refs/t3"],
+    });
+    assert.strictEqual(refs.stdout, "");
+  }).pipe(Effect.scoped, Effect.provide(layerGitContract)),
+);
+
+it.effect(
+  "checkpoint restore leaves a submodule alone when its checkpoint predates snapshots",
+  () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const driver = yield* GitVcsDriver.makeVcsDriverShape();
+      const { root, submodule } = yield* makeSubmoduleRepo();
+      const checkpointRef = submoduleRef("legacy");
+      yield* driver.checkpoints.captureCheckpoint({ cwd: root, checkpointRef });
+      yield* runGit(submodule, ["update-ref", "-d", checkpointRef]);
+      yield* fileSystem.writeFileString(path.join(submodule, "a.txt"), "one\nuser\n");
+
+      assert.isTrue(
+        yield* driver.checkpoints.restoreCheckpoint({
+          cwd: root,
+          checkpointRef,
+          fallbackToHead: false,
+        }),
+      );
+      assert.strictEqual(
+        yield* fileSystem.readFileString(path.join(submodule, "a.txt")),
+        "one\nuser\n",
+      );
+    }).pipe(Effect.scoped, Effect.provide(layerGitContract)),
+);
+
+it.effect("checkpoint diffs keep the pointer change for a submodule they cannot read", () =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const driver = yield* GitVcsDriver.makeVcsDriverShape();
+    const { root, submodule } = yield* makeSubmoduleRepo();
+    const fromCheckpointRef = submoduleRef("readable");
+    const toCheckpointRef = submoduleRef("unreadable");
+    yield* driver.checkpoints.captureCheckpoint({ cwd: root, checkpointRef: fromCheckpointRef });
+    yield* fileSystem.writeFileString(path.join(submodule, "a.txt"), "one\nagent\n");
+    yield* driver.checkpoints.captureCheckpoint({ cwd: root, checkpointRef: toCheckpointRef });
+    yield* runGit(root, ["submodule", "deinit", "--force", "frontend"]);
+
+    const patch = yield* driver.checkpoints.diffCheckpoints({
+      cwd: root,
+      fromCheckpointRef,
+      toCheckpointRef,
+      ignoreWhitespace: false,
+    });
+    assert.include(patch, "Subproject commit");
+  }).pipe(Effect.scoped, Effect.provide(layerGitContract)),
+);
+
 // The real VCS process, spawning `command` wherever the driver runs git.
 const vcsProcessSpawning = (command: string) =>
   Layer.effect(

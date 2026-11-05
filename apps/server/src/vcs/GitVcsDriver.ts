@@ -26,6 +26,7 @@ import {
   type ReviewDiffPreviewResult,
   type ReviewDiffFileContentsInput,
   type ReviewDiffFileContentsResult,
+  type VcsError,
   type VcsInitInput,
   type VcsListRefsInput,
   type VcsListRefsResult,
@@ -38,7 +39,10 @@ import {
 import { isMissingExecutable } from "@t3tools/source-control-core/server/discovery";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import {
+  GITLINK_MODE,
   makeGitVcsDriverCore,
+  parseGitmodulesPaths,
+  parseGitTreeEntries,
   PATCH_RENDER_PREFIX_ARGS,
   splitNullSeparatedGitStdoutPaths,
 } from "./GitVcsDriverCore.ts";
@@ -447,6 +451,7 @@ const WORKSPACE_FILES_MAX_OUTPUT_BYTES = 16 * 1024 * 1024;
 const FLAGGED_INDEX_ENTRIES_MAX_BYTES = 1024 * 1024;
 const CHECKPOINT_RECOVERY_MAX_CANDIDATES = 64;
 const CHECKPOINT_RECOVERY_TIMEOUT = "5 seconds";
+const SUBMODULE_CAPTURE_CONCURRENCY = 4;
 const GIT_CHECK_IGNORE_MAX_STDIN_BYTES = 256 * 1024;
 const WORKSPACE_GIT_HARDENED_CONFIG_ARGS = [
   "-c",
@@ -525,6 +530,46 @@ function parseGitRemoteVerboseOutput(
     remotes.set(name, remote);
   }
   return remotes;
+}
+
+interface ChangedSubmodule {
+  readonly path: string;
+  readonly cwd: string;
+  readonly fromRevision: string;
+  readonly toRevision: string;
+  readonly added: boolean;
+}
+
+interface CheckpointDiffRange {
+  readonly cwd: string;
+  readonly fromRevision: string;
+  readonly toRevision: string;
+  readonly ignoreWhitespace: boolean;
+  readonly format: "patch" | "numstat";
+  readonly maxOutputBytes: number;
+  /** Repository-relative location of `cwd` within the outermost repository, with a trailing slash. */
+  readonly prefix: string;
+  readonly filePaths?: ReadonlyArray<string>;
+}
+
+function prefixNumstatPaths(numstat: string, prefix: string): string {
+  let renamePaths = 0;
+  return numstat
+    .split("\0")
+    .map((record) => {
+      if (renamePaths > 0) {
+        renamePaths -= 1;
+        return `${prefix}${record}`;
+      }
+      const counts = /^(?:\d+|-)\t(?:\d+|-)\t/.exec(record)?.[0];
+      if (counts === undefined) return record;
+      if (counts.length === record.length) {
+        renamePaths = 2;
+        return record;
+      }
+      return `${counts}${prefix}${record.slice(counts.length)}`;
+    })
+    .join("\0");
 }
 
 const gitCommand = Effect.fn("GitVcsDriver.gitCommand")(
@@ -896,6 +941,321 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
   // core.longpaths is disabled in the user's Git configuration.
   const longPaths = hostPlatform === "win32" ? ["-c", "core.longpaths=true"] : [];
 
+  const hasGitRepository = (cwd: string) =>
+    fileSystem.exists(path.join(cwd, ".git")).pipe(Effect.orElseSucceed(() => false));
+
+  // Walks the filesystem so repositories without submodules start no extra git process.
+  const findsGitmodules = Effect.fn("GitVcsDriver.checkpoints.findsGitmodules")(function* (
+    cwd: string,
+  ) {
+    for (let directory = cwd; ; directory = path.dirname(directory)) {
+      const found = yield* fileSystem
+        .exists(path.join(directory, ".gitmodules"))
+        .pipe(Effect.orElseSucceed(() => false));
+      if (found) return true;
+      if ((yield* hasGitRepository(directory)) || directory === path.dirname(directory)) {
+        return false;
+      }
+    }
+  });
+
+  // Each submodule checkpoints into its own repository, and the parent's checkpoint tree
+  // records that snapshot as the gitlink. Only .gitmodules paths under cwd are in scope.
+  const readSubmodulePaths = Effect.fn("GitVcsDriver.checkpoints.readSubmodulePaths")(function* (
+    operation: string,
+    cwd: string,
+  ) {
+    if (!(yield* findsGitmodules(cwd))) return { toplevel: cwd, paths: [] };
+    const location = yield* execute({
+      operation,
+      cwd,
+      args: ["rev-parse", "--show-toplevel", "--show-prefix"],
+      allowNonZeroExit: true,
+    });
+    const [toplevel = "", prefix = ""] = location.stdout.split("\n");
+    const configured =
+      location.exitCode === 0 &&
+      (yield* fileSystem
+        .exists(path.join(toplevel, ".gitmodules"))
+        .pipe(Effect.orElseSucceed(() => false)));
+    if (!configured) return { toplevel, paths: [] };
+    const config = yield* execute({
+      operation,
+      cwd: toplevel,
+      args: ["config", "-z", "--file", ".gitmodules", "--get-regexp", "^submodule\\..*\\.path$"],
+      allowNonZeroExit: true,
+    });
+    if (config.exitCode !== 0) return { toplevel, paths: [] };
+    const paths = parseGitmodulesPaths(config.stdout).filter(
+      (entry) => entry.startsWith(prefix) && !path.isAbsolute(entry),
+    );
+    return { toplevel, paths };
+  });
+
+  const readGitlinks = Effect.fn("GitVcsDriver.checkpoints.readGitlinks")(function* (
+    operation: string,
+    toplevel: string,
+    revision: string,
+    paths: ReadonlyArray<string>,
+  ) {
+    const tree = yield* execute({
+      operation,
+      cwd: toplevel,
+      args: ["ls-tree", "-z", revision, "--", ...paths],
+    });
+    const gitlinks = new Map<string, string>();
+    for (const [file, entry] of parseGitTreeEntries(tree.stdout)) {
+      if (entry.mode === GITLINK_MODE) gitlinks.set(file, entry.oid);
+    }
+    return gitlinks;
+  });
+
+  const hasCommit = (operation: string, cwd: string, commit: string) =>
+    execute({
+      operation,
+      cwd,
+      args: ["cat-file", "-e", `${commit}^{commit}`],
+      allowNonZeroExit: true,
+      env: { ...process.env, GIT_NO_LAZY_FETCH: "1" },
+    }).pipe(Effect.map((result) => result.exitCode === 0));
+
+  // A submodule that cannot be read stays out of this list, so its pointer change still shows.
+  const readChangedSubmodules = Effect.fn("GitVcsDriver.checkpoints.readChangedSubmodules")(
+    function* (operation: string, cwd: string, fromRevision: string, toRevision: string) {
+      const { toplevel, paths } = yield* readSubmodulePaths(operation, cwd);
+      const changed: Array<ChangedSubmodule> = [];
+      if (paths.length === 0) return changed;
+      const [fromLinks, toLinks] = yield* Effect.all([
+        readGitlinks(operation, toplevel, fromRevision, paths),
+        readGitlinks(operation, toplevel, toRevision, paths),
+      ]);
+      for (const submodulePath of paths) {
+        const from = fromLinks.get(submodulePath);
+        const to = toLinks.get(submodulePath);
+        if (to === undefined || from === to) continue;
+        const submoduleCwd = path.join(toplevel, submodulePath);
+        if (!(yield* hasGitRepository(submoduleCwd))) continue;
+        if (!(yield* hasCommit(operation, submoduleCwd, to))) continue;
+        if (from !== undefined && !(yield* hasCommit(operation, submoduleCwd, from))) continue;
+        const emptyTree =
+          from === undefined
+            ? (yield* execute({
+                operation,
+                cwd: submoduleCwd,
+                args: ["hash-object", "-t", "tree", "--stdin"],
+                stdin: "",
+              })).stdout.trim()
+            : undefined;
+        changed.push({
+          path: submodulePath,
+          cwd: submoduleCwd,
+          fromRevision: emptyTree ?? `${from}^{commit}`,
+          toRevision: `${to}^{commit}`,
+          added: from === undefined,
+        });
+      }
+      return changed;
+    },
+  );
+
+  const diffRange: (input: CheckpointDiffRange) => Effect.Effect<string, VcsError> = Effect.fn(
+    "GitVcsDriver.checkpoints.diffRange",
+  )(function* (input) {
+    const operation = "GitVcsDriver.checkpoints.diffCheckpoints";
+    const submodules = yield* readChangedSubmodules(
+      operation,
+      input.cwd,
+      input.fromRevision,
+      input.toRevision,
+    );
+    const inSubmodule = (file: string) =>
+      submodules.some((submodule) => file.startsWith(`${submodule.path}/`));
+    const ownPaths = input.filePaths?.filter((file) => !inSubmodule(file));
+    const pathspec =
+      ownPaths !== undefined
+        ? // Paths are repository-relative, while cwd can be a subdirectory.
+          ["--", ...ownPaths.map((file) => `:(top,literal)${file}`)]
+        : submodules.length > 0
+          ? [
+              "--",
+              ":(top)",
+              ...submodules.map((submodule) => `:(exclude,top,literal)${submodule.path}`),
+            ]
+          : [];
+    let output = "";
+    if (input.filePaths === undefined || input.filePaths.length === 0 || ownPaths?.length !== 0) {
+      const result = yield* execute({
+        operation,
+        cwd: input.cwd,
+        args: [
+          // Not --no-relative, which Git before 2.28 rejects.
+          "-c",
+          "diff.relative=false",
+          "-c",
+          "diff.suppressBlankEmpty=false",
+          "diff",
+          ...(input.format === "numstat" ? ["--numstat", "-z"] : ["--patch"]),
+          "--no-color",
+          "--no-ext-diff",
+          "--no-textconv",
+          "--submodule=short",
+          ...(input.prefix === ""
+            ? PATCH_RENDER_PREFIX_ARGS
+            : [`--src-prefix=a/${input.prefix}`, `--dst-prefix=b/${input.prefix}`]),
+          ...(input.ignoreWhitespace ? ["--ignore-all-space"] : []),
+          input.fromRevision,
+          input.toRevision,
+          ...pathspec,
+        ],
+        allowNonZeroExit: true,
+        maxOutputBytes: input.maxOutputBytes,
+        outputMode: input.format === "numstat" ? "error" : "truncate",
+      });
+
+      if (result.exitCode !== 0) {
+        return yield* new VcsProcessExitError({
+          operation,
+          command: "git diff",
+          cwd: input.cwd,
+          exitCode: result.exitCode,
+          detail: result.stderr.trim() || "Checkpoint ref is unavailable for diff operation.",
+        });
+      }
+      output =
+        input.format === "numstat" && input.prefix !== ""
+          ? prefixNumstatPaths(result.stdout, input.prefix)
+          : result.stdout;
+    }
+
+    for (const submodule of submodules) {
+      const maxOutputBytes = input.maxOutputBytes - Buffer.byteLength(output);
+      if (maxOutputBytes <= 0) break;
+      const filePaths = input.filePaths?.flatMap((file) =>
+        file.startsWith(`${submodule.path}/`) ? [file.slice(submodule.path.length + 1)] : [],
+      );
+      if (filePaths?.length === 0) continue;
+      output += yield* diffRange({
+        ...input,
+        cwd: submodule.cwd,
+        fromRevision: submodule.fromRevision,
+        toRevision: submodule.toRevision,
+        maxOutputBytes,
+        prefix: `${input.prefix}${submodule.path}/`,
+        ...(filePaths === undefined ? {} : { filePaths }),
+      });
+    }
+    return output;
+  });
+
+  const readAuthoredPaths = Effect.fn("GitVcsDriver.checkpoints.readAuthoredPaths")(function* (
+    cwd: string,
+    fromRevision: string,
+    toRevision: string,
+  ) {
+    const operation = "GitVcsDriver.checkpoints.listAuthoredPaths";
+    const heads = yield* execute({
+      operation,
+      cwd,
+      args: ["log", "--no-walk=unsorted", "--format=%P %ct", fromRevision, toRevision],
+    });
+    const [fromLine = "", toLine = ""] = heads.stdout.trimEnd().split("\n");
+    const [startHead = "", capturedAt = ""] = fromLine.split(" ");
+    const [endHead = ""] = toLine.split(" ");
+    if (startHead === "" || endHead === "" || startHead === endHead) {
+      return null;
+    }
+
+    const listPaths = (args: ReadonlyArray<string>) =>
+      execute({
+        operation,
+        cwd,
+        args: [
+          "-c",
+          "diff.relative=false",
+          // log.showSignature prints verification text into the path list.
+          "-c",
+          "log.showSignature=false",
+          ...args,
+          "--name-only",
+          "-z",
+          "--no-renames",
+          "--no-ext-diff",
+        ],
+        maxOutputBytes: VcsDriver.CHECKPOINT_DIFF_MAX_OUTPUT_BYTES,
+        outputMode: "error",
+      }).pipe(Effect.map((result) => result.stdout.split("\0")));
+    // Remerge diffs retain merge conflict fixes while excluding clean upstream changes.
+    const pathLists = yield* Effect.all(
+      [
+        listPaths(["diff", startHead, fromRevision]),
+        listPaths(["diff", endHead, toRevision]),
+        listPaths(["log", "--format=", "--diff-merges=remerge", `${endHead}..${startHead}`]),
+        listPaths([
+          "log",
+          "--format=",
+          "--diff-merges=remerge",
+          `--since=@${capturedAt}`,
+          `${startHead}..${endHead}`,
+        ]),
+      ],
+      { concurrency: "unbounded" },
+    );
+    return new Set(pathLists.flat().filter((path) => path.length > 0));
+  });
+
+  // Repositories move HEAD independently, so one with an unmoved HEAD contributes every changed
+  // path: the caller's flat path set must still keep those files once another one is filtered.
+  const readAuthoredTree: (input: {
+    readonly cwd: string;
+    readonly fromRevision: string;
+    readonly toRevision: string;
+    readonly added: boolean;
+  }) => Effect.Effect<{ readonly paths: Set<string>; readonly filtered: boolean }, VcsError> =
+    Effect.fn("GitVcsDriver.checkpoints.readAuthoredTree")(function* (input) {
+      const operation = "GitVcsDriver.checkpoints.listAuthoredPaths";
+      const authored = input.added
+        ? null
+        : yield* readAuthoredPaths(input.cwd, input.fromRevision, input.toRevision);
+      const submodules = yield* readChangedSubmodules(
+        operation,
+        input.cwd,
+        input.fromRevision,
+        input.toRevision,
+      );
+      const changed =
+        authored ??
+        (yield* execute({
+          operation,
+          cwd: input.cwd,
+          args: [
+            "-c",
+            "diff.relative=false",
+            "diff",
+            "--name-only",
+            "-z",
+            "--no-renames",
+            "--no-ext-diff",
+            input.fromRevision,
+            input.toRevision,
+            "--",
+            ":(top)",
+            ...submodules.map((submodule) => `:(exclude,top,literal)${submodule.path}`),
+          ],
+          maxOutputBytes: VcsDriver.CHECKPOINT_DIFF_MAX_OUTPUT_BYTES,
+          outputMode: "error",
+        })).stdout
+          .split("\0")
+          .filter((file) => file.length > 0);
+      const paths = new Set(changed);
+      let filtered = authored !== null;
+      for (const submodule of submodules) {
+        const nested = yield* readAuthoredTree(submodule);
+        filtered ||= nested.filtered;
+        for (const file of nested.paths) paths.add(`${submodule.path}/${file}`);
+      }
+      return { paths, filtered };
+    });
+
   const checkpoints: VcsDriver.VcsCheckpointOps = {
     captureCheckpoint: Effect.fn("GitVcsDriver.checkpoints.captureCheckpoint")(function* (input) {
       const operation = VcsProcess.CHECKPOINT_CAPTURE_OPERATION;
@@ -1238,6 +1598,64 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
           }),
         );
 
+        const { toplevel, paths: submodulePaths } = yield* readSubmodulePaths(operation, input.cwd);
+        if (submodulePaths.length > 0) {
+          const staged = yield* execute({
+            operation,
+            cwd: toplevel,
+            args: [
+              ...indexConfig,
+              "ls-files",
+              "--stage",
+              "-z",
+              "--",
+              ...submodulePaths.map((file) => `:(top,literal)${file}`),
+            ],
+            env: commitEnv,
+          });
+          const gitlinks = staged.stdout
+            .split("\0")
+            .filter((entry) => entry.startsWith("160000 "))
+            .map((entry) => entry.slice(entry.indexOf("\t") + 1));
+          const snapshots = yield* Effect.forEach(
+            gitlinks,
+            // The nested captureCheckpoint span already traces each submodule.
+            Effect.fnUntraced(function* (gitlink) {
+              const cwd = path.join(toplevel, gitlink);
+              if (!(yield* hasGitRepository(cwd))) return [];
+              const snapshot = yield* checkpoints
+                .captureCheckpoint({ cwd, checkpointRef: input.checkpointRef })
+                .pipe(
+                  Effect.andThen(resolveCheckpointCommit(cwd, input.checkpointRef)),
+                  Effect.catch((cause) =>
+                    Effect.logWarning("submodule checkpoint capture failed", {
+                      submodule: gitlink,
+                      cause: String(cause),
+                    }).pipe(Effect.as(null)),
+                  ),
+                );
+              return snapshot === null ? [] : [`160000 ${snapshot}\t${gitlink}\0`];
+            }),
+            { concurrency: SUBMODULE_CAPTURE_CONCURRENCY },
+          );
+          if (snapshots.flat().length > 0) {
+            yield* execute({
+              operation,
+              cwd: input.cwd,
+              args: [
+                ...indexConfig,
+                "-c",
+                "index.sparse=false",
+                "update-index",
+                "-z",
+                "--index-info",
+              ],
+              stdin: snapshots.flat().join(""),
+              env: commitEnv,
+            });
+          }
+        }
+
         const writeTreeResult = yield* execute({
           operation,
           cwd: input.cwd,
@@ -1320,6 +1738,8 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
           args: [
             ...longPaths,
             "restore",
+            // submodule.recurse would otherwise check the hidden snapshot out as HEAD.
+            "--no-recurse-submodules",
             "--source",
             commitOid,
             "--worktree",
@@ -1376,6 +1796,25 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
         args: [...longPaths, "reset", "--quiet", "--", "."],
       });
 
+      const { toplevel, paths: submodulePaths } = yield* readSubmodulePaths(operation, input.cwd);
+      if (submodulePaths.length > 0) {
+        const gitlinks = yield* readGitlinks(operation, toplevel, commitOid, submodulePaths);
+        for (const [submodulePath, gitlink] of gitlinks) {
+          const cwd = path.join(toplevel, submodulePath);
+          // Older checkpoints hold a plain commit, which never recorded the submodule's edits.
+          if (
+            (yield* hasGitRepository(cwd)) &&
+            (yield* resolveCheckpointCommit(cwd, input.checkpointRef)) === gitlink
+          ) {
+            yield* checkpoints.restoreCheckpoint({
+              cwd,
+              checkpointRef: input.checkpointRef,
+              fallbackToHead: false,
+            });
+          }
+        }
+      }
+
       return true;
     }),
 
@@ -1414,104 +1853,35 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
         }
       }
 
-      const result = yield* execute({
-        operation,
+      return yield* diffRange({
         cwd: input.cwd,
-        args: [
-          // Not --no-relative, which Git before 2.28 rejects.
-          "-c",
-          "diff.relative=false",
-          "-c",
-          "diff.suppressBlankEmpty=false",
-          "diff",
-          ...(input.format === "numstat" ? ["--numstat", "-z"] : ["--patch"]),
-          "--no-color",
-          "--no-ext-diff",
-          "--no-textconv",
-          "--submodule=short",
-          ...PATCH_RENDER_PREFIX_ARGS,
-          ...(input.ignoreWhitespace ? ["--ignore-all-space"] : []),
-          `${fromRevision}^{commit}`,
-          `${input.toCheckpointRef}^{commit}`,
-          // Paths are repository-relative, while cwd can be a subdirectory.
-          ...(input.filePaths
-            ? ["--", ...input.filePaths.map((file) => `:(top,literal)${file}`)]
-            : []),
-        ],
-        allowNonZeroExit: true,
+        fromRevision: `${fromRevision}^{commit}`,
+        toRevision: `${input.toCheckpointRef}^{commit}`,
+        ignoreWhitespace: input.ignoreWhitespace,
+        format: input.format ?? "patch",
         maxOutputBytes: input.maxOutputBytes ?? VcsDriver.CHECKPOINT_DIFF_MAX_OUTPUT_BYTES,
-        outputMode: input.format === "numstat" ? "error" : "truncate",
+        prefix: "",
+        ...(input.filePaths === undefined ? {} : { filePaths: input.filePaths }),
       });
-
-      if (result.exitCode !== 0) {
-        return yield* new VcsProcessExitError({
-          operation,
-          command: "git diff",
-          cwd: input.cwd,
-          exitCode: result.exitCode,
-          detail: result.stderr.trim() || "Checkpoint ref is unavailable for diff operation.",
-        });
-      }
-
-      return result.stdout;
     }),
 
     listAuthoredPaths: Effect.fn("GitVcsDriver.checkpoints.listAuthoredPaths")(function* (input) {
-      const operation = "GitVcsDriver.checkpoints.listAuthoredPaths";
-      const heads = yield* execute({
-        operation,
-        cwd: input.cwd,
-        args: [
-          "log",
-          "--no-walk=unsorted",
-          "--format=%P %ct",
-          `${input.fromCheckpointRef}^{commit}`,
-          `${input.toCheckpointRef}^{commit}`,
-        ],
-      });
-      const [fromLine = "", toLine = ""] = heads.stdout.trimEnd().split("\n");
-      const [startHead = "", capturedAt = ""] = fromLine.split(" ");
-      const [endHead = ""] = toLine.split(" ");
-      if (startHead === "" || endHead === "" || startHead === endHead) {
-        return null;
-      }
-
-      const listPaths = (args: ReadonlyArray<string>) =>
-        execute({
-          operation,
-          cwd: input.cwd,
-          args: [
-            "-c",
-            "diff.relative=false",
-            // log.showSignature prints verification text into the path list.
-            "-c",
-            "log.showSignature=false",
-            ...args,
-            "--name-only",
-            "-z",
-            "--no-renames",
-            "--no-ext-diff",
-          ],
-          maxOutputBytes: VcsDriver.CHECKPOINT_DIFF_MAX_OUTPUT_BYTES,
-          outputMode: "error",
-        }).pipe(Effect.map((result) => result.stdout.split("\0")));
-      // Remerge diffs retain merge conflict fixes while excluding clean upstream changes.
-      const pathLists = yield* Effect.all(
-        [
-          listPaths(["diff", startHead, `${input.fromCheckpointRef}^{commit}`]),
-          listPaths(["diff", endHead, `${input.toCheckpointRef}^{commit}`]),
-          listPaths(["log", "--format=", "--diff-merges=remerge", `${endHead}..${startHead}`]),
-          listPaths([
-            "log",
-            "--format=",
-            "--diff-merges=remerge",
-            `--since=@${capturedAt}`,
-            `${startHead}..${endHead}`,
-          ]),
-        ],
-        { concurrency: "unbounded" },
+      const fromRevision = `${input.fromCheckpointRef}^{commit}`;
+      const toRevision = `${input.toCheckpointRef}^{commit}`;
+      const { paths: submodulePaths } = yield* readSubmodulePaths(
+        "GitVcsDriver.checkpoints.listAuthoredPaths",
+        input.cwd,
       );
-      return new Set(pathLists.flat().filter((path) => path.length > 0));
+      if (submodulePaths.length === 0) {
+        return yield* readAuthoredPaths(input.cwd, fromRevision, toRevision);
+      }
+      const { paths, filtered } = yield* readAuthoredTree({
+        cwd: input.cwd,
+        fromRevision,
+        toRevision,
+        added: false,
+      });
+      return filtered ? paths : null;
     }),
 
     deleteCheckpointRefs: Effect.fn("GitVcsDriver.checkpoints.deleteCheckpointRefs")(
@@ -1527,6 +1897,16 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
             }),
           { discard: true },
         );
+        const { toplevel, paths } = yield* readSubmodulePaths(
+          "GitVcsDriver.checkpoints.deleteCheckpointRefs",
+          input.cwd,
+        );
+        for (const submodulePath of paths) {
+          const cwd = path.join(toplevel, submodulePath);
+          if (yield* hasGitRepository(cwd)) {
+            yield* checkpoints.deleteCheckpointRefs({ cwd, checkpointRefs: input.checkpointRefs });
+          }
+        }
       },
     ),
   };
